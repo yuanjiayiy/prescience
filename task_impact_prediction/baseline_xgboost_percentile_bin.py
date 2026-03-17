@@ -1,4 +1,4 @@
-"""XGBoost regressor baseline for impact prediction with configurable features."""
+"""XGBoost classifier baseline for year-wise citation percentile-bin prediction (10 bins)."""
 
 import os
 import gc
@@ -7,12 +7,16 @@ import argparse
 import numpy as np
 import torch
 import xgboost as xgb
+from collections import defaultdict
 from hyperopt import fmin, tpe, hp, Trials, STATUS_OK
+from sklearn.metrics import log_loss, accuracy_score, f1_score
 
 import utils
 from task_impact_prediction.dataset import (
-    load_corpus_impact, load_soft_membership_map, create_evaluation_instances, get_papers_for_instances, build_feature_matrix
+    load_corpus_impact, create_evaluation_instances, get_papers_for_instances, build_feature_matrix
 )
+
+NUM_BINS = 10
 
 HYPEROPT_SPACE = {
     "eta": hp.loguniform("eta", np.log(0.01), np.log(0.2)),
@@ -28,7 +32,7 @@ HYPEROPT_SPACE = {
 
 def build_model_name(args):
     """Build model name from feature flags."""
-    parts = ["xgboost_regressor", args.embedding_type]
+    parts = ["xgboost_percentile_bin_classifier", args.embedding_type, f"bins{NUM_BINS}"]
     if args.use_author_names:
         parts.append("author_names")
     if args.use_author_numbers:
@@ -41,15 +45,49 @@ def build_model_name(args):
         parts.append("prior_work_numbers")
     if args.use_followup_work_paper:
         parts.append("followup_work_paper")
-    if args.use_publication_time:
-        parts.append("publication_time")
-    if args.use_soft_membership:
-        parts.append("soft_membership")
     return "_".join(parts)
 
 
-def train_regressor(X_train, y_train, num_evals, device):
-    """Train XGBoost regressor with hyperopt tuning."""
+def assign_yearwise_bins(instances, num_bins=NUM_BINS):
+    """Assign citation percentile bins within publication year.
+
+    Returns:
+      - corpus_id_to_bin: mapping corpus_id -> int in [0, num_bins-1]
+      - corpus_id_to_year: mapping corpus_id -> publication year (str)
+    """
+    by_year = defaultdict(list)
+    for date, instance in instances:
+        year = date[:4]
+        by_year[year].append((instance["corpus_id"], float(instance["gt_citations"])))
+
+    corpus_id_to_bin = {}
+    corpus_id_to_year = {}
+
+    for year, records in by_year.items():
+        citations = np.array([citation for _, citation in records], dtype=np.float32)
+
+        if len(records) == 1:
+            corpus_id, _ = records[0]
+            corpus_id_to_bin[corpus_id] = 0
+            corpus_id_to_year[corpus_id] = year
+            continue
+
+        order = np.argsort(citations, kind="mergesort")
+        ranks = np.empty(len(citations), dtype=np.float32)
+        ranks[order] = np.arange(len(citations), dtype=np.float32)
+
+        percentiles = ranks / float(len(citations))
+        bins = np.minimum((percentiles * num_bins).astype(np.int32), num_bins - 1)
+
+        for (corpus_id, _), bin_id in zip(records, bins):
+            corpus_id_to_bin[corpus_id] = int(bin_id)
+            corpus_id_to_year[corpus_id] = year
+
+    return corpus_id_to_bin, corpus_id_to_year
+
+
+def train_classifier(X_train, y_train, num_evals, device):
+    """Train XGBoost multiclass classifier with hyperopt tuning."""
     val_size = max(1, int(len(X_train) * 0.3))
     train_size = len(X_train) - val_size
     X_tr, X_val = X_train[:train_size], X_train[train_size:]
@@ -60,16 +98,23 @@ def train_regressor(X_train, y_train, num_evals, device):
         trial_params["max_depth"] = int(trial_params["max_depth"])
         trial_params["min_child_weight"] = int(trial_params["min_child_weight"])
 
-        model = xgb.XGBRegressor(**trial_params, verbosity=0, device=device)
+        model = xgb.XGBClassifier(
+            **trial_params,
+            objective="multi:softprob",
+            num_class=NUM_BINS,
+            eval_metric="mlogloss",
+            verbosity=0,
+            device=device,
+        )
         model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
-        preds = model.predict(X_val)
-        mse = float(np.mean((preds - y_val) ** 2))
+        probs = model.predict_proba(X_val)
+        loss = float(log_loss(y_val, probs, labels=list(range(NUM_BINS))))
 
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
-        return {"loss": mse, "status": STATUS_OK}
+        return {"loss": loss, "status": STATUS_OK}
 
     best = fmin(fn=objective, space=HYPEROPT_SPACE, algo=tpe.suggest, max_evals=num_evals, trials=Trials())
     best["max_depth"] = int(best["max_depth"])
@@ -77,7 +122,14 @@ def train_regressor(X_train, y_train, num_evals, device):
 
     utils.log(f"Best hyperparameters: {best}")
 
-    model = xgb.XGBRegressor(**best, verbosity=0, device=device)
+    model = xgb.XGBClassifier(
+        **best,
+        objective="multi:softprob",
+        num_class=NUM_BINS,
+        eval_metric="mlogloss",
+        verbosity=0,
+        device=device,
+    )
     model.fit(X_train, y_train, verbose=False)
     return model
 
@@ -86,12 +138,12 @@ def load_or_train_model(model_path, X_train, y_train, num_evals, device):
     """Load model from disk or train a new one."""
     if os.path.exists(model_path):
         utils.log(f"Loading model from {model_path}")
-        model = xgb.XGBRegressor()
+        model = xgb.XGBClassifier()
         model.load_model(model_path)
         return model
 
-    utils.log(f"Training XGBoost regressor with {num_evals} hyperopt evaluations")
-    model = train_regressor(X_train, y_train, num_evals, device)
+    utils.log(f"Training XGBoost percentile-bin classifier with {num_evals} hyperopt evaluations")
+    model = train_classifier(X_train, y_train, num_evals, device)
 
     os.makedirs(os.path.dirname(model_path), exist_ok=True)
     model.save_model(model_path)
@@ -99,16 +151,26 @@ def load_or_train_model(model_path, X_train, y_train, num_evals, device):
     return model
 
 
-def predict(model, X_test, test_corpus_ids):
-    """Generate predictions from model."""
-    y_pred_log = model.predict(X_test)
-    y_pred = np.expm1(y_pred_log)
-    y_pred = np.maximum(y_pred, 0)
-    return [{"corpus_id": cid, "predicted_citations": float(pred)} for cid, pred in zip(test_corpus_ids, y_pred)]
+def predict(model, X_test, test_corpus_ids, corpus_id_to_year):
+    """Generate percentile-bin predictions."""
+    probs = model.predict_proba(X_test)
+    pred_bins = np.argmax(probs, axis=1)
+    confidences = np.max(probs, axis=1)
+
+    outputs = []
+    for cid, pred_bin, confidence, prob_vec in zip(test_corpus_ids, pred_bins, confidences, probs):
+        outputs.append({
+            "corpus_id": cid,
+            "year": corpus_id_to_year.get(cid),
+            "predicted_percentile_bin": int(pred_bin),
+            "confidence": float(confidence),
+            "bin_probabilities": [float(x) for x in prob_vec.tolist()],
+        })
+    return outputs
 
 
 def main():
-    parser = argparse.ArgumentParser(description="XGBoost regressor baseline for impact prediction")
+    parser = argparse.ArgumentParser(description="XGBoost classifier for year-wise citation percentile bins")
     parser.add_argument("--hf_repo_id", type=str, default="allenai/prescience", help="HuggingFace repo ID")
     parser.add_argument("--split", type=str, default="test", choices=["train", "test"], help="Dataset split to evaluate on")
     parser.add_argument("--train_split", type=str, default="train", choices=["train", "test"], help="Dataset split to train on")
@@ -121,20 +183,15 @@ def main():
     parser.add_argument("--use_prior_work_papers", action="store_true", help="Include key reference embeddings")
     parser.add_argument("--use_prior_work_numbers", action="store_true", help="Include key reference citation counts")
     parser.add_argument("--use_followup_work_paper", action="store_true", help="Include paper embedding")
-    parser.add_argument("--use_publication_time", action="store_true", help="Include publication year and month")
-    parser.add_argument("--use_soft_membership", action="store_true", help="Include soft membership vector")
-    parser.add_argument("--soft_membership_repo_id", type=str, default="yuancarrieyjy/PreScience-augmented", help="HuggingFace repo with soft_membership vectors")
-    parser.add_argument("--impact_months", type=int, default=12, help="Number of months to predict impact for")
+    parser.add_argument("--impact_months", type=int, default=12, help="Number of months used for citation target")
     parser.add_argument("--num_evals", type=int, default=100, help="Number of hyperopt evaluations")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--output_dir", type=str, default="data/task_impact_prediction/test/predictions", help="Output directory")
     args = parser.parse_args()
 
-    # Validate at least one feature flag is set
     feature_flags = [
         args.use_author_names, args.use_author_numbers, args.use_author_papers,
-        args.use_prior_work_papers, args.use_prior_work_numbers, args.use_followup_work_paper,
-        args.use_publication_time, args.use_soft_membership,
+        args.use_prior_work_papers, args.use_prior_work_numbers, args.use_followup_work_paper
     ]
     if not any(feature_flags):
         parser.error("At least one feature flag must be set (e.g., --use_followup_work_paper)")
@@ -146,38 +203,33 @@ def main():
     model_path = os.path.join(args.output_dir, "models", f"{model_name}.model")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     author_embedding_cache = {}
-    train_soft_membership_map, test_soft_membership_map = None, None
-    train_soft_membership_dim, test_soft_membership_dim = 0, 0
 
-    # Load corpora
     utils.log(f"Loading training corpus from {args.hf_repo_id} (split={args.train_split})")
-    train_papers, train_dict, train_embeddings, _ = load_corpus_impact(hf_repo_id=args.hf_repo_id, split=args.train_split, embeddings_dir=args.train_embeddings_dir, embedding_type=args.embedding_type)
+    train_papers, train_dict, train_embeddings, _ = load_corpus_impact(
+        hf_repo_id=args.hf_repo_id,
+        split=args.train_split,
+        embeddings_dir=args.train_embeddings_dir,
+        embedding_type=args.embedding_type,
+    )
     utils.log(f"Loaded {len(train_papers)} training papers")
 
     utils.log(f"Loading test corpus from {args.hf_repo_id} (split={args.split})")
-    test_papers, test_dict, test_embeddings, test_metadata = load_corpus_impact(hf_repo_id=args.hf_repo_id, split=args.split, embeddings_dir=args.test_embeddings_dir, embedding_type=args.embedding_type)
+    test_papers, test_dict, test_embeddings, test_metadata = load_corpus_impact(
+        hf_repo_id=args.hf_repo_id,
+        split=args.split,
+        embeddings_dir=args.test_embeddings_dir,
+        embedding_type=args.embedding_type,
+    )
     utils.log(f"Loaded {len(test_papers)} test papers")
 
-    if args.use_soft_membership:
-        utils.log(f"Loading soft membership vectors from {args.soft_membership_repo_id}")
-        train_soft_membership_map, train_soft_membership_dim = load_soft_membership_map(
-            hf_repo_id=args.soft_membership_repo_id,
-            split=args.train_split,
-        )
-        test_soft_membership_map, test_soft_membership_dim = load_soft_membership_map(
-            hf_repo_id=args.soft_membership_repo_id,
-            split=args.split,
-        )
-        utils.log(f"Loaded train soft memberships: {len(train_soft_membership_map)} (dim={train_soft_membership_dim})")
-        utils.log(f"Loaded test soft memberships: {len(test_soft_membership_map)} (dim={test_soft_membership_dim})")
-
-    # Create evaluation instances
     utils.log("Creating evaluation instances")
     train_instances = create_evaluation_instances(train_papers, args.impact_months)
     test_instances = create_evaluation_instances(test_papers, args.impact_months)
     utils.log(f"Train instances: {len(train_instances)}, Test instances: {len(test_instances)}")
 
-    # Build training features (only if model doesn't exist)
+    train_corpus_id_to_bin, _ = assign_yearwise_bins(train_instances, num_bins=NUM_BINS)
+    test_corpus_id_to_bin, test_corpus_id_to_year = assign_yearwise_bins(test_instances, num_bins=NUM_BINS)
+
     X_train = y_train = None
     if not os.path.exists(model_path):
         train_papers_filtered = get_papers_for_instances(train_instances, train_dict, require_key_references=True)
@@ -186,39 +238,33 @@ def main():
             train_papers_filtered, train_dict, train_embeddings, args.embedding_type,
             args.use_author_names, args.use_author_numbers, args.use_author_papers,
             args.use_prior_work_papers, args.use_prior_work_numbers, args.use_followup_work_paper,
-            author_embedding_cache,
-            use_publication_time=args.use_publication_time,
-            use_soft_membership=args.use_soft_membership,
-            soft_membership_map=train_soft_membership_map,
-            soft_membership_dim=train_soft_membership_dim,
-            desc="Training features"
+            author_embedding_cache, desc="Training features"
         )
-        corpus_id_to_gt = {inst["corpus_id"]: inst["gt_citations"] for _, inst in train_instances}
-        y_train = np.log1p(np.array([corpus_id_to_gt[cid] for cid in train_corpus_ids], dtype=np.float32))
+        y_train = np.array([train_corpus_id_to_bin[cid] for cid in train_corpus_ids], dtype=np.int32)
         utils.log(f"Training matrix shape: {X_train.shape}")
 
-    # Load or train model
     model = load_or_train_model(model_path, X_train, y_train, args.num_evals, device)
 
-    # Build test features
     test_papers_list = get_papers_for_instances(test_instances, test_dict)
     utils.log(f"Building test features for {len(test_papers_list)} papers")
     X_test, test_corpus_ids = build_feature_matrix(
         test_papers_list, test_dict, test_embeddings, args.embedding_type,
         args.use_author_names, args.use_author_numbers, args.use_author_papers,
         args.use_prior_work_papers, args.use_prior_work_numbers, args.use_followup_work_paper,
-        author_embedding_cache,
-        use_publication_time=args.use_publication_time,
-        use_soft_membership=args.use_soft_membership,
-        soft_membership_map=test_soft_membership_map,
-        soft_membership_dim=test_soft_membership_dim,
-        desc="Test features"
+        author_embedding_cache, desc="Test features"
     )
     utils.log(f"Test matrix shape: {X_test.shape}")
 
-    # Predict and save
-    utils.log("Generating predictions")
-    predictions = predict(model, X_test, test_corpus_ids)
+    utils.log("Generating percentile-bin predictions")
+    predictions = predict(model, X_test, test_corpus_ids, test_corpus_id_to_year)
+
+    eval_labels = [test_corpus_id_to_bin[cid] for cid in test_corpus_ids if cid in test_corpus_id_to_bin]
+    eval_preds = [p["predicted_percentile_bin"] for p in predictions if p["corpus_id"] in test_corpus_id_to_bin]
+    if eval_labels and len(eval_labels) == len(eval_preds):
+        acc = float(accuracy_score(eval_labels, eval_preds))
+        macro_f1 = float(f1_score(eval_labels, eval_preds, average="macro"))
+        utils.log(f"Bin classification accuracy: {acc:.4f}")
+        utils.log(f"Bin classification macro-F1: {macro_f1:.4f}")
 
     output_filename = f"predictions.{model_name}.json"
     output_path = os.path.join(args.output_dir, output_filename)

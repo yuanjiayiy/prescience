@@ -30,6 +30,34 @@ def load_corpus_impact(hf_repo_id="allenai/prescience", split="test", embeddings
     return all_papers, all_papers_dict, embeddings, metadata
 
 
+def load_soft_membership_map(hf_repo_id="yuancarrieyjy/PreScience-augmented", split="test"):
+    """Load soft-membership vectors keyed by corpus_id from a HuggingFace dataset split.
+
+    Returns:
+      - soft_membership_map: dict corpus_id -> list[float]
+      - soft_membership_dim: inferred vector dimension (0 if none found)
+    """
+    all_papers, _, _ = utils.load_corpus(
+        hf_repo_id=hf_repo_id,
+        split=split,
+        embeddings_dir=None,
+        embedding_type=None,
+        load_sd2publications=False,
+    )
+
+    soft_membership_map = {}
+    soft_membership_dim = 0
+    for paper in all_papers:
+        soft_membership = paper.get("soft_membership")
+        if soft_membership is None:
+            continue
+        if soft_membership_dim == 0:
+            soft_membership_dim = len(soft_membership)
+        soft_membership_map[paper["corpus_id"]] = soft_membership
+
+    return soft_membership_map, soft_membership_dim
+
+
 def create_evaluation_instances(all_papers, impact_months):
     """Create evaluation instances for impact prediction.
 
@@ -63,7 +91,9 @@ def get_embedding_dim(all_embeddings):
 def create_features(record, all_papers_dict, all_embeddings, embedding_type,
                     use_author_names, use_author_numbers, use_author_papers,
                     use_prior_work_papers, use_prior_work_numbers, use_followup_work_paper,
-                    author_embedding_cache, embed_dim=None):
+                    author_embedding_cache,
+                    use_publication_time=False, use_soft_membership=False,
+                    embed_dim=None, soft_membership_map=None, soft_membership_dim=0):
     """Extract feature vector for a single paper.
 
     Returns numpy array of features based on enabled flags.
@@ -207,6 +237,25 @@ def create_features(record, all_papers_dict, all_embeddings, embedding_type,
             paper_embedding = embedded_paper["key"].reshape(-1)
         features.extend(paper_embedding.tolist())
 
+    if use_publication_time:
+        date = record.get("date", "")
+        try:
+            year = int(date[:4])
+            month = int(date[5:7])
+        except Exception:
+            year, month = 0, 0
+        features.extend([float(year), float(month)])
+
+    if use_soft_membership:
+        soft_membership = record.get("soft_membership")
+        if soft_membership is None and soft_membership_map is not None:
+            soft_membership = soft_membership_map.get(record["corpus_id"])
+
+        if soft_membership is not None:
+            features.extend([float(x) for x in soft_membership])
+        else:
+            features.extend([0.0] * soft_membership_dim)
+
     return np.array(features, dtype=np.float32)
 
 
@@ -230,7 +279,9 @@ def precompute_author_name_embeddings(papers, embedding_type, author_embedding_c
 def build_feature_matrix(papers, all_papers_dict, embeddings, embedding_type,
                          use_author_names, use_author_numbers, use_author_papers,
                          use_prior_work_papers, use_prior_work_numbers, use_followup_work_paper,
-                         author_embedding_cache, desc="Building features"):
+                         author_embedding_cache,
+                         use_publication_time=False, use_soft_membership=False,
+                         soft_membership_map=None, soft_membership_dim=0, desc="Building features"):
     """Build feature matrix for a list of papers.
 
     Returns (X, corpus_ids) where X is a numpy array of shape (n_papers, n_features).
@@ -247,7 +298,11 @@ def build_feature_matrix(papers, all_papers_dict, embeddings, embedding_type,
             paper, all_papers_dict, embeddings, embedding_type,
             use_author_names, use_author_numbers, use_author_papers,
             use_prior_work_papers, use_prior_work_numbers, use_followup_work_paper,
-            author_embedding_cache, embed_dim=embed_dim
+            author_embedding_cache,
+            use_publication_time, use_soft_membership,
+            embed_dim=embed_dim,
+            soft_membership_map=soft_membership_map,
+            soft_membership_dim=soft_membership_dim,
         )
         if len(features) > 0:
             X.append(features)

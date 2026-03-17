@@ -77,8 +77,8 @@ def refresh_all_papers(all_papers: List[dict], snapshot_map: Dict[str, Dict[str,
 def main() -> None:
     args = parse_args()
 
-    input_path = os.path.join(args.input_dir, "all_papers.stage05.json")
-    output_path = os.path.join(args.output_dir, "all_papers.stage06.json")
+    input_path = os.path.join(args.input_dir, "all_papers.stage02.json")
+    output_path = os.path.join(args.output_dir, "all_papers.stage03.json")
     snapshot_path = os.path.abspath(args.snapshot_path)
     if not os.path.exists(snapshot_path):
         raise FileNotFoundError(f"Snapshot file not found at {snapshot_path}")
